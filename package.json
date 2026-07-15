@@ -1,5 +1,5 @@
 {
-  "version": "3.0.0",
+  "version": "4.0.0",
   "name": "separate-code",
   "displayName": "Separate Code",
   "publisher": "SaidTorres3",
@@ -21,6 +21,26 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "languages": [
+      { "id": "separate-javascript", "aliases": ["Separate JavaScript"] },
+      { "id": "separate-typescript", "aliases": ["Separate TypeScript"] },
+      { "id": "separate-php", "aliases": ["Separate PHP"] },
+      { "id": "separate-css", "aliases": ["Separate CSS"] },
+      { "id": "separate-scss", "aliases": ["Separate SCSS"] },
+      { "id": "separate-less", "aliases": ["Separate Less"] },
+      { "id": "separate-json", "aliases": ["Separate JSON"] },
+      { "id": "separate-html", "aliases": ["Separate HTML"] }
+    ],
+    "grammars": [
+      { "language": "separate-javascript", "scopeName": "source.separate.javascript", "path": "./syntaxes/separate-javascript.tmLanguage.json" },
+      { "language": "separate-typescript", "scopeName": "source.separate.typescript", "path": "./syntaxes/separate-typescript.tmLanguage.json" },
+      { "language": "separate-php", "scopeName": "source.separate.php", "path": "./syntaxes/separate-php.tmLanguage.json" },
+      { "language": "separate-css", "scopeName": "source.separate.css", "path": "./syntaxes/separate-css.tmLanguage.json" },
+      { "language": "separate-scss", "scopeName": "source.separate.scss", "path": "./syntaxes/separate-scss.tmLanguage.json" },
+      { "language": "separate-less", "scopeName": "source.separate.less", "path": "./syntaxes/separate-less.tmLanguage.json" },
+      { "language": "separate-json", "scopeName": "source.separate.json", "path": "./syntaxes/separate-json.tmLanguage.json" },
+      { "language": "separate-html", "scopeName": "text.separate.html", "path": "./syntaxes/separate-html.tmLanguage.json" }
+    ],
     "commands": [
       {
         "command": "extension.separate",

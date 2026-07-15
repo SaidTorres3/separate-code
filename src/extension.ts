@@ -16,6 +16,10 @@ const debounceTimers: Map<string, NodeJS.Timeout> = new Map();
 // Define a debounce delay in milliseconds
 const DEBOUNCE_DELAY = 10;
 
+const isolatedLanguageIds = new Set([
+	'javascript', 'typescript', 'php', 'css', 'scss', 'less', 'json', 'html'
+]);
+
 // Define decoration types for original editor
 const originalDecorationType = vscode.window.createTextEditorDecorationType({
 	backgroundColor: 'rgba(135,206,250, 0.3)', // Light sky blue with transparency
@@ -27,13 +31,22 @@ interface TempTab {
 	tempFileName: string;
 	tempUri: vscode.Uri;
 	originalUri: string;
+	syntaxPrefix: string;
 	disposables: vscode.Disposable[];
 	isProgrammaticSave: boolean;
 	isClosed: boolean;
 	originalRange: vscode.Range; // Changed from Selection to Range
 }
 
+export interface SyntaxContext {
+	languageId: string;
+	prefix: string;
+}
+
 export function activate(context: vscode.ExtensionContext) {
+	const mirroredDiagnostics = vscode.languages.createDiagnosticCollection('separate-code');
+	context.subscriptions.push(mirroredDiagnostics);
+
 	const disposable = vscode.commands.registerCommand('extension.separate', async () => {
 		const editor = vscode.window.activeTextEditor;
 		if (!editor) {
@@ -90,6 +103,7 @@ export function activate(context: vscode.ExtensionContext) {
 					}
 
 					// Clean up associated resources
+					mirroredDiagnostics.delete(existingTempTab.tempUri);
 					existingTempTab.disposables.forEach(disposable => disposable.dispose());
 					try {
 						if (fs.existsSync(existingTempTab.tempFileName)) {
@@ -104,13 +118,26 @@ export function activate(context: vscode.ExtensionContext) {
 				}
 			}
 
+			// Determine the isolated grammar without letting validators parse the
+			// fragment as a complete source file.
+			const syntaxContext = getSyntaxContext(
+				editor.document.languageId,
+				editor.document.getText(),
+				editor.document.offsetAt(selection.start)
+			);
+			const syntaxPrefix = syntaxContext.prefix;
+
 			// Determine the original file extension
 			const originalExtension = getFileExtension(editor.document.uri);
 
 			// Create a temporary file with a unique name and the same extension as the original
-			const tempFileName = path.join(os.tmpdir(), `separate-${Date.now()}${originalExtension ? `.${originalExtension}` : ''}`);
+			const originalExtensionSuffix = originalExtension ? `.${originalExtension}` : '';
+			const tempFileName = path.join(
+				os.tmpdir(),
+				`separate-${Date.now()}${originalExtensionSuffix}.separate-code`
+			);
 			try {
-				await writeFileAsync(tempFileName, selectedText);
+				await writeFileAsync(tempFileName, syntaxPrefix + selectedText);
 			} catch (error) {
 				vscode.window.showErrorMessage(`Failed to create temporary file: ${error}`);
 				return;
@@ -128,8 +155,8 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 
 			// Ensure the language mode matches the original
-			if (editor.document.languageId) {
-				await vscode.languages.setTextDocumentLanguage(newDoc, editor.document.languageId);
+			if (syntaxContext.languageId) {
+				await vscode.languages.setTextDocumentLanguage(newDoc, syntaxContext.languageId);
 			}
 
 			try {
@@ -144,6 +171,7 @@ export function activate(context: vscode.ExtensionContext) {
 				tempFileName,
 				tempUri,
 				originalUri,
+				syntaxPrefix,
 				disposables: [],
 				isProgrammaticSave: false,
 				isClosed: false,
@@ -153,7 +181,7 @@ export function activate(context: vscode.ExtensionContext) {
 			activeTempTabs.set(originalUri, tempTab);
 
 			// Sync changes between original and extracted documents
-			syncDocuments(editor.document, newDoc, tempTab);
+			syncDocuments(editor.document, newDoc, tempTab, mirroredDiagnostics);
 
 			// Immediately update decorations for the selection
 			const originalEditor = vscode.window.visibleTextEditors.find(
@@ -196,6 +224,83 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(saveListener);
 }
 
+/**
+ * Returns the minimum leading context required to tokenize a separated
+ * fragment the same way it was tokenized in its source document.
+ */
+export function getSyntaxPrefix(languageId: string, documentText: string, selectionStartOffset: number): string {
+	return getSyntaxContext(languageId, documentText, selectionStartOffset).prefix;
+}
+
+/**
+ * Determines the standalone language mode and parser prefix for a fragment.
+ * Embedded language state normally comes from text before the selection, which
+ * is absent when only the selected text is opened in another document.
+ */
+export function getSyntaxContext(languageId: string, documentText: string, selectionStartOffset: number): SyntaxContext {
+	const textBeforeSelection = documentText.slice(0, selectionStartOffset);
+	const embeddedLanguage = getActiveHtmlEmbeddedLanguage(textBeforeSelection, languageId);
+	if (embeddedLanguage) {
+		return { languageId: getIsolatedLanguageId(embeddedLanguage), prefix: '' };
+	}
+
+	return { languageId: getIsolatedLanguageId(languageId), prefix: '' };
+}
+
+function getIsolatedLanguageId(languageId: string): string {
+	return isolatedLanguageIds.has(languageId) ? `separate-${languageId}` : languageId;
+}
+
+function getActiveHtmlEmbeddedLanguage(textBeforeSelection: string, documentLanguageId: string): string | null {
+	// Tags inside PHP expressions or strings are not HTML parser state.
+	const htmlContext = documentLanguageId === 'php'
+		? textBeforeSelection.replace(/(?:<\?(?:php\b|=)|<\?(?!xml))[\s\S]*?(?:\?>|$)/gi, '')
+		: textBeforeSelection;
+	const tagPattern = /<(\/?)\s*(script|style)\b([^>]*)>/gi;
+	const activeTags: Array<{ name: string; languageId: string }> = [];
+	let match: RegExpExecArray | null;
+
+	while ((match = tagPattern.exec(htmlContext)) !== null) {
+		const isClosingTag = match[1] === '/';
+		const name = match[2].toLowerCase();
+
+		if (isClosingTag) {
+			for (let index = activeTags.length - 1; index >= 0; index--) {
+				if (activeTags[index].name === name) {
+					activeTags.splice(index, 1);
+					break;
+				}
+			}
+		} else {
+			activeTags.push({
+				name,
+				languageId: getEmbeddedLanguageId(name, match[3])
+			});
+		}
+	}
+
+	return activeTags.length > 0 ? activeTags[activeTags.length - 1].languageId : null;
+}
+
+function getEmbeddedLanguageId(tagName: string, attributes: string): string {
+	const languageMatch = /\b(?:lang|type)\s*=\s*["']?([^\s"'>]+)/i.exec(attributes);
+	const language = languageMatch?.[1].toLowerCase();
+
+	if (tagName === 'style') {
+		if (language === 'scss' || language === 'text/scss') { return 'scss'; }
+		if (language === 'less' || language === 'text/less') { return 'less'; }
+		return 'css';
+	}
+
+	if (language === 'ts' || language === 'typescript' || language === 'text/typescript') {
+		return 'typescript';
+	}
+	if (language === 'json' || language === 'application/json' || language === 'application/ld+json') {
+		return 'json';
+	}
+	return 'javascript';
+}
+
 // Helper function to get file extension from a URI
 function getFileExtension(uri: vscode.Uri): string | null {
 	const ext = path.extname(uri.fsPath);
@@ -215,7 +320,12 @@ function debounce(func: (...args: any[]) => void, delay: number) {
 	};
 }
 
-function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.TextDocument, tempTab: TempTab) {
+function syncDocuments(
+	originalDoc: vscode.TextDocument,
+	extractedDoc: vscode.TextDocument,
+	tempTab: TempTab,
+	mirroredDiagnostics: vscode.DiagnosticCollection
+) {
 	let isUpdating = false;
 	let originalRange = tempTab.originalRange;
 	let pendingChanges: vscode.TextDocumentContentChangeEvent[] = [];
@@ -259,6 +369,47 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 			originalEditor.setDecorations(originalDecorationType, []);
 		}
 	};
+
+	const updateMirroredDiagnostics = () => {
+		const prefixStart = extractedDoc.positionAt(tempTab.syntaxPrefix.length);
+		const diagnostics = vscode.languages.getDiagnostics(originalDoc.uri)
+			.map(diagnostic => {
+				const intersection = tempTab.originalRange.intersection(diagnostic.range);
+				if (!intersection) { return null; }
+
+				const translatePosition = (position: vscode.Position) => {
+					const relativeLine = position.line - tempTab.originalRange.start.line;
+					const relativeCharacter = relativeLine === 0
+						? position.character - tempTab.originalRange.start.character
+						: position.character;
+					return new vscode.Position(
+						prefixStart.line + relativeLine,
+						(relativeLine === 0 ? prefixStart.character : 0) + relativeCharacter
+					);
+				};
+
+				const mirrored = new vscode.Diagnostic(
+					new vscode.Range(translatePosition(intersection.start), translatePosition(intersection.end)),
+					diagnostic.message,
+					diagnostic.severity
+				);
+				mirrored.source = diagnostic.source;
+				mirrored.code = diagnostic.code;
+				mirrored.tags = diagnostic.tags;
+				mirrored.relatedInformation = diagnostic.relatedInformation;
+				return mirrored;
+			})
+			.filter((diagnostic): diagnostic is vscode.Diagnostic => diagnostic !== null);
+
+		mirroredDiagnostics.set(extractedDoc.uri, diagnostics);
+	};
+
+	updateMirroredDiagnostics();
+	const diagnosticListener = vscode.languages.onDidChangeDiagnostics(event => {
+		if (event.uris.some(uri => uri.toString() === originalDoc.uri.toString())) {
+			updateMirroredDiagnostics();
+		}
+	});
 
 	// Function to process pending changes
 	async function processPendingChanges() {
@@ -333,7 +484,7 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 		const newText = originalDoc.getText(originalRange);
 		const edit = new vscode.WorkspaceEdit();
 		const fullRange = new vscode.Range(
-			extractedDoc.positionAt(0),
+			extractedDoc.positionAt(tempTab.syntaxPrefix.length),
 			extractedDoc.positionAt(extractedDoc.getText().length)
 		);
 		edit.replace(extractedDoc.uri, fullRange, newText);
@@ -344,6 +495,7 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 
 		// Update decorations
 		updateDecorations();
+		updateMirroredDiagnostics();
 
 		// Trigger debounced autosave
 		debouncedAutosave();
@@ -381,7 +533,10 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 
 		isUpdating = true;
 
-		const newText = extractedDoc.getText();
+		const extractedText = extractedDoc.getText();
+		const newText = extractedText.startsWith(tempTab.syntaxPrefix)
+			? extractedText.slice(tempTab.syntaxPrefix.length)
+			: extractedText;
 		const edit = new vscode.WorkspaceEdit();
 		edit.replace(originalDoc.uri, originalRange, newText);
 		await vscode.workspace.applyEdit(edit);
@@ -396,6 +551,7 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 
 		tempTab.originalRange = originalRange;
 		updateDecorations();
+		updateMirroredDiagnostics();
 		debouncedAutosave();
 
 		isUpdating = false;
@@ -412,6 +568,7 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 
 		if (!isExtractedDocVisible) {
 			tempTab.isClosed = true;
+			mirroredDiagnostics.delete(extractedDoc.uri);
 			clearDecorations();
 			tempTab.disposables.forEach(disposable => disposable.dispose());
 
@@ -427,7 +584,7 @@ function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.Te
 		}
 	});
 
-	tempTab.disposables.push(originalToExtracted, extractedToOriginal, closeHandler);
+	tempTab.disposables.push(originalToExtracted, extractedToOriginal, closeHandler, diagnosticListener);
 }
 
 export function deactivate() {
